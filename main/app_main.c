@@ -27,6 +27,9 @@
 #include "esp_system.h"
 #include "esp_log.h"
 
+#include "driver/gpio.h"
+#include "driver/ledc.h"
+
 #include "owb.h"
 #include "owb_rmt.h"
 #include "ds18b20.h"
@@ -36,6 +39,57 @@
 #define DS18B20_RESOLUTION   (DS18B20_RESOLUTION_12_BIT)
 #define SAMPLE_PERIOD        (1000)   // milliseconds
 
+static void led_task(void *pvParameters) {
+    // Prepare and then apply the LEDC PWM timer configuration
+    ledc_timer_config_t ledc_timer_0 = {
+        .speed_mode       = LEDC_HIGH_SPEED_MODE,
+        .timer_num        = LEDC_TIMER_0,
+        .duty_resolution  = LEDC_TIMER_8_BIT,
+        .freq_hz          = 1000,  // Set output frequency at 5 kHz
+        .clk_cfg          = LEDC_AUTO_CLK
+    };
+    ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer_0));
+
+    // Prepare and then apply the LEDC PWM channel configuration
+    ledc_channel_config_t ledc_channel_1 = {
+        .speed_mode     = LEDC_HIGH_SPEED_MODE,
+        .channel        = LEDC_CHANNEL_0,
+        .timer_sel      = LEDC_TIMER_0,
+        .intr_type      = LEDC_INTR_DISABLE,
+        .gpio_num       = GPIO_NUM_19,
+        .duty           = 0, // Set duty to 0%
+        .hpoint         = 0
+    };
+    ledc_channel_config_t ledc_channel_2 = {
+        .speed_mode     = LEDC_HIGH_SPEED_MODE,
+        .channel        = LEDC_CHANNEL_1,
+        .timer_sel      = LEDC_TIMER_0,
+        .intr_type      = LEDC_INTR_DISABLE,
+        .gpio_num       = GPIO_NUM_21,
+        .duty           = 0, // Set duty to 0%
+        .hpoint         = 0
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel_1));
+    ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel_2));
+
+    int steps[] = {
+        0, 16, 32, 48, 64, 80, 96, 112, 128, 128, 112, 96, 80, 64, 48, 32, 16, 0
+    };
+    int n_steps = sizeof(steps) / sizeof(steps[0]);
+    for (;;) {
+        for (int i = 0; i < n_steps; i++) {
+            // Wait 10s and update the duty cycle
+            vTaskDelay(100.0 / portTICK_PERIOD_MS);
+            ESP_ERROR_CHECK(ledc_set_duty(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_0, steps[i]));
+            ESP_ERROR_CHECK(ledc_set_duty(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_1, steps[(i+4)%n_steps]));
+            ESP_ERROR_CHECK(ledc_update_duty(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_0));
+            ESP_ERROR_CHECK(ledc_update_duty(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_1));
+        }
+    }
+
+    vTaskDelete(NULL);
+}
+
 _Noreturn void app_main()
 {
     // Override global log level
@@ -44,6 +98,18 @@ _Noreturn void app_main()
     // To debug, use 'make menuconfig' to set default Log level to DEBUG, then uncomment:
     //esp_log_level_set("owb", ESP_LOG_DEBUG);
     //esp_log_level_set("ds18b20", ESP_LOG_DEBUG);
+
+    BaseType_t xReturned;
+    xReturned = xTaskCreate(led_task,
+                            "led_task",
+                            4096,           /* Stack size in words, not bytes. */
+                            NULL,           /* Parameter passed into the task. */
+                            tskIDLE_PRIORITY + 12,
+                            NULL);
+    if (xReturned != pdPASS) {
+        ESP_LOGE("led", "xTaskCreate('led_task'): %d", xReturned);
+        abort();
+    }
 
     // Stable readings require a brief period before communication
     vTaskDelay(2000.0 / portTICK_PERIOD_MS);
@@ -72,50 +138,6 @@ _Noreturn void app_main()
     }
     printf("Found %d device%s\n", num_devices, num_devices == 1 ? "" : "s");
 
-    // In this example, if a single device is present, then the ROM code is probably
-    // not very interesting, so just print it out. If there are multiple devices,
-    // then it may be useful to check that a specific device is present.
-
-    if (num_devices == 1)
-    {
-        // For a single device only:
-        OneWireBus_ROMCode rom_code;
-        owb_status status = owb_read_rom(owb, &rom_code);
-        if (status == OWB_STATUS_OK)
-        {
-            char rom_code_s[OWB_ROM_CODE_STRING_LENGTH];
-            owb_string_from_rom_code(rom_code, rom_code_s, sizeof(rom_code_s));
-            printf("Single device %s present\n", rom_code_s);
-        }
-        else
-        {
-            printf("An error occurred reading ROM code: %d", status);
-        }
-    }
-    else
-    {
-        // Search for a known ROM code (LSB first):
-        // For example: 0x1502162ca5b2ee28
-        OneWireBus_ROMCode known_device = {
-            .fields.family = { 0x28 },
-            .fields.serial_number = { 0xee, 0xb2, 0xa5, 0x2c, 0x16, 0x02 },
-            .fields.crc = { 0x15 },
-        };
-        char rom_code_s[OWB_ROM_CODE_STRING_LENGTH];
-        owb_string_from_rom_code(known_device, rom_code_s, sizeof(rom_code_s));
-        bool is_present = false;
-
-        owb_status search_status = owb_verify_rom(owb, known_device, &is_present);
-        if (search_status == OWB_STATUS_OK)
-        {
-            printf("Device %s is %s\n", rom_code_s, is_present ? "present" : "not present");
-        }
-        else
-        {
-            printf("An error occurred searching for known device: %d", search_status);
-        }
-    }
-
     // Create DS18B20 devices on the 1-Wire bus
     DS18B20_Info * devices[MAX_DEVICES] = {0};
     for (int i = 0; i < num_devices; ++i)
@@ -135,18 +157,6 @@ _Noreturn void app_main()
         ds18b20_use_crc(ds18b20_info, true);           // enable CRC check on all reads
         ds18b20_set_resolution(ds18b20_info, DS18B20_RESOLUTION);
     }
-
-//    // Read temperatures from all sensors sequentially
-//    while (1)
-//    {
-//        printf("\nTemperature readings (degrees C):\n");
-//        for (int i = 0; i < num_devices; ++i)
-//        {
-//            float temp = ds18b20_get_temp(devices[i]);
-//            printf("  %d: %.3f\n", i, temp);
-//        }
-//        vTaskDelay(1000 / portTICK_PERIOD_MS);
-//    }
 
     // Check for parasitic-powered devices
     bool parasitic_power = false;
